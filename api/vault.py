@@ -1,78 +1,81 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import hashlib
-import secrets
-import time
-import uuid
-from threading import Lock
-from typing import Dict, Tuple
+from fastapi import FastAPI, HTTPException, status
+from pydantic import BaseModel
 
-from .models import KeyRecord, KeyStatus
+from .models import KeyCreateRequest, KeyRecord, KeyStatus
+from .vault import vault
 
-
-class ApiKeyVault:
-    def __init__(self) -> None:
-        self._keys: Dict[str, KeyRecord] = {}
-        self._lock = Lock()
-        self._validation_count: int = 0
-
-    def create_key(self, client_name: str, days: int) -> Tuple[str, KeyRecord]:
-        raw_key = secrets.token_urlsafe(32)
-        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
-        key_id = str(uuid.uuid4())
-        key_prefix = raw_key[:8]
-        now = time.time()
-        expires_at = now + days * 86400
-        record = KeyRecord(
-            key_id=key_id,
-            key_prefix=key_prefix,
-            key_hash=key_hash,
-            client_name=client_name,
-            status=KeyStatus.ACTIVE,
-            created_at=now,
-            expires_at=expires_at,
-            usage_count=0,
-        )
-        with self._lock:
-            self._keys[key_id] = record
-        return raw_key, record
-
-    def validate_key(self, raw_api_key: str) -> Tuple[bool, str]:
-        key_hash = hashlib.sha256(raw_api_key.encode()).hexdigest()
-        with self._lock:
-            for record in self._keys.values():
-                if record.key_hash == key_hash:
-                    if record.status != KeyStatus.ACTIVE:
-                        return False, ""
-                    if record.expires_at < time.time():
-                        record.status = KeyStatus.EXPIRED
-                        return False, ""
-                    record.usage_count += 1
-                    self._validation_count += 1
-                    return True, record.client_name
-        return False, ""
-
-    def revoke_key(self, key_id: str) -> bool:
-        with self._lock:
-            record = self._keys.get(key_id)
-            if record and record.status == KeyStatus.ACTIVE:
-                record.status = KeyStatus.REVOKED
-                return True
-        return False
-
-    def metrics(self) -> Dict[str, int]:
-        with self._lock:
-            active = sum(1 for r in self._keys.values() if r.status == KeyStatus.ACTIVE)
-            revoked = sum(1 for r in self._keys.values() if r.status == KeyStatus.REVOKED)
-            expired = sum(1 for r in self._keys.values() if r.status == KeyStatus.EXPIRED)
-            return {
-                "active_keys": active,
-                "revoked_keys": revoked,
-                "expired_keys": expired,
-                "validation_count": self._validation_count,
-            }
+app = FastAPI(title="MEA API Key Vault - Enterprise")
 
 
-# Instância Singleton para compartilhamento de estado em RAM
-vault = ApiKeyVault()
+class KeyCreateResponse(BaseModel):
+    key_id: str
+    key_prefix: str
+    client_name: str
+    status: KeyStatus
+    created_at: float
+    expires_at: float
+    usage_count: int
+    raw_key: str
+
+
+class KeyValidateRequest(BaseModel):
+    api_key: str
+
+
+class KeyValidateResponse(BaseModel):
+    valid: bool
+    client: str | None = None
+
+
+class RevokeResponse(BaseModel):
+    key_id: str
+    status: KeyStatus
+
+
+class MetricsResponse(BaseModel):
+    active_keys: int
+    revoked_keys: int
+    expired_keys: int
+    validation_count: int
+
+
+@app.post("/keys/create", status_code=status.HTTP_201_CREATED, response_model=KeyCreateResponse)
+def create_key(req: KeyCreateRequest) -> KeyCreateResponse:
+    raw_key, record = vault.create_key(req.client_name, req.expires_in_days, req.rate_limit_per_minute)
+    return KeyCreateResponse(
+        key_id=record.key_id,
+        key_prefix=record.key_prefix,
+        client_name=record.client_name,
+        status=record.status,
+        created_at=record.created_at,
+        expires_at=record.expires_at,
+        usage_count=record.usage_count,
+        raw_key=raw_key,
+    )
+
+
+@app.post("/keys/validate", response_model=KeyValidateResponse)
+def validate_key(req: KeyValidateRequest) -> KeyValidateResponse:
+    valid, client, code = vault.validate_key(req.api_key)
+    if not valid:
+        if code == 429:
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired key")
+    return KeyValidateResponse(valid=True, client=client)
+
+
+@app.post("/keys/{key_id}/revoke", response_model=RevokeResponse)
+def revoke_key(key_id: str) -> RevokeResponse:
+    if not vault.revoke_key(key_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Key not found or already revoked")
+    record = vault._keys_by_hash[vault._id_to_hash[key_id]]
+    return RevokeResponse(key_id=key_id, status=record.status)
+
+
+@app.get("/metrics", response_model=MetricsResponse)
+def get_metrics() -> MetricsResponse:
+    m = vault.metrics()
+    return MetricsResponse(**m)
