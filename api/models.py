@@ -28,3 +28,6 @@ class KeyRecord:
     created_at: float
     expires_at: float
     usage_count: int
+    rate_limit_per_minute: int
+    _last_reset_ts: float
+    _current_window_count: int
