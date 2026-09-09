@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from .models import KeyCreateRequest, KeyRecord, KeyStatus
 from .vault import vault
 
-app = FastAPI(title="MEA API Key Vault")
+app = FastAPI(title="MEA API Key Vault - Enterprise")
 
 
 class KeyCreateResponse(BaseModel):
@@ -44,7 +44,7 @@ class MetricsResponse(BaseModel):
 
 @app.post("/keys/create", status_code=status.HTTP_201_CREATED, response_model=KeyCreateResponse)
 def create_key(req: KeyCreateRequest) -> KeyCreateResponse:
-    raw_key, record = vault.create_key(req.client_name, req.expires_in_days)
+    raw_key, record = vault.create_key(req.client_name, req.expires_in_days, req.rate_limit_per_minute)
     return KeyCreateResponse(
         key_id=record.key_id,
         key_prefix=record.key_prefix,
@@ -59,8 +59,10 @@ def create_key(req: KeyCreateRequest) -> KeyCreateResponse:
 
 @app.post("/keys/validate", response_model=KeyValidateResponse)
 def validate_key(req: KeyValidateRequest) -> KeyValidateResponse:
-    valid, client = vault.validate_key(req.api_key)
+    valid, client, code = vault.validate_key(req.api_key)
     if not valid:
+        if code == 429:
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired key")
     return KeyValidateResponse(valid=True, client=client)
 
@@ -69,7 +71,7 @@ def validate_key(req: KeyValidateRequest) -> KeyValidateResponse:
 def revoke_key(key_id: str) -> RevokeResponse:
     if not vault.revoke_key(key_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Key not found or already revoked")
-    record = vault._keys[key_id]
+    record = vault._keys_by_hash[vault._id_to_hash[key_id]]
     return RevokeResponse(key_id=key_id, status=record.status)
 
 
